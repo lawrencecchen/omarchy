@@ -30,6 +30,11 @@
   opacity: 0.5;
 }
 
+#workspaces button.active {
+  background-color: @foreground;
+  color: @background;
+}
+
 #cpu,
 #battery,
 #pulseaudio,
