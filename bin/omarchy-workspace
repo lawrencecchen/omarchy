@@ -1,0 +1,609 @@
+#!/bin/bash
+
+# omarchy:summary=Manage workspace tabs and network isolation
+# omarchy:args=<apply|audit|focus|launch|list|move|network|rename|shell|tabbar|netns> ...
+# omarchy:examples=omarchy workspace list | omarchy workspace tabbar left | omarchy workspace launch 2 alacritty
+
+set -euo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+WORKSPACE_CONFIG="$CONFIG_HOME/omarchy/workspaces.tsv"
+DEFAULT_WORKSPACE_CONFIG="$OMARCHY_PATH/config/omarchy/workspaces.tsv"
+NET_PREFIX="${OMARCHY_WORKSPACE_NET_PREFIX:-10.214}"
+NET_DNS="${OMARCHY_WORKSPACE_DNS:-1.1.1.1}"
+
+usage() {
+  cat <<USAGE
+Usage:
+  omarchy workspace list
+  omarchy workspace apply
+  omarchy workspace focus <workspace>
+  omarchy workspace move <workspace>
+  omarchy workspace rename <workspace> <label>
+  omarchy workspace network <workspace> [host|isolated|offline]
+  omarchy workspace launch <workspace> <command...>
+  omarchy workspace shell [workspace]
+  omarchy workspace tabbar <top|bottom|left|right> [side-width]
+  omarchy workspace audit
+  omarchy workspace netns <up|down|enter> <workspace>
+USAGE
+}
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+current_user() {
+  if [[ -n ${USER:-} ]]; then
+    echo "$USER"
+  else
+    id -un
+  fi
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+ensure_config() {
+  mkdir -p "$(dirname "$WORKSPACE_CONFIG")"
+
+  if [[ -f $WORKSPACE_CONFIG ]]; then
+    return
+  fi
+
+  if [[ -f $DEFAULT_WORKSPACE_CONFIG ]]; then
+    cp "$DEFAULT_WORKSPACE_CONFIG" "$WORKSPACE_CONFIG"
+    return
+  fi
+
+  cat >"$WORKSPACE_CONFIG" <<'EOF'
+# id	label	network
+1	home	isolated
+2	code	isolated
+3	web	isolated
+4	chat	isolated
+5	ops	isolated
+EOF
+}
+
+workspace_rows() {
+  ensure_config
+  awk -F '\t' '
+    /^[[:space:]]*#/ { next }
+    NF < 1 { next }
+    $1 != "" { print }
+  ' "$WORKSPACE_CONFIG"
+}
+
+validate_workspace_id() {
+  local id="$1"
+
+  [[ $id =~ ^[0-9]+$ ]] || die "Workspace must be a number, label, or active: $id"
+  (( id >= 1 && id <= 250 )) || die "Workspace must be between 1 and 250: $id"
+}
+
+hypr_available() {
+  command -v hyprctl >/dev/null 2>&1 && hyprctl activeworkspace -j >/dev/null 2>&1
+}
+
+active_workspace() {
+  if hypr_available; then
+    hyprctl activeworkspace -j | jq -r '.id'
+  else
+    echo "1"
+  fi
+}
+
+workspace_label() {
+  local id="$1"
+  local label
+
+  ensure_config
+  label=$(awk -F '\t' -v id="$id" '$1 == id { print $2; found = 1; exit } END { if (!found) exit 1 }' "$WORKSPACE_CONFIG" 2>/dev/null || true)
+  [[ -n $label ]] && echo "$label" || echo "$id"
+}
+
+workspace_network() {
+  local id="$1"
+  local mode
+
+  ensure_config
+  mode=$(awk -F '\t' -v id="$id" '$1 == id { print $3; found = 1; exit } END { if (!found) exit 1 }' "$WORKSPACE_CONFIG" 2>/dev/null || true)
+  [[ -n $mode ]] && echo "$mode" || echo "isolated"
+}
+
+resolve_workspace() {
+  local value="${1:-active}"
+  local id
+
+  if [[ $value == "active" ]]; then
+    id=$(active_workspace)
+  elif [[ $value =~ ^[0-9]+$ ]]; then
+    id="$value"
+  else
+    ensure_config
+    id=$(awk -F '\t' -v label="$value" '$2 == label { print $1; found = 1; exit } END { if (!found) exit 1 }' "$WORKSPACE_CONFIG" 2>/dev/null || true)
+    [[ -n $id ]] || die "Unknown workspace: $value"
+  fi
+
+  validate_workspace_id "$id"
+  echo "$id"
+}
+
+set_workspace() {
+  local id="$1"
+  local label="$2"
+  local mode="$3"
+  local tmp
+
+  validate_workspace_id "$id"
+  [[ -n $label ]] || die "Workspace label cannot be empty"
+  [[ $mode =~ ^(host|isolated|offline)$ ]] || die "Network mode must be host, isolated, or offline"
+
+  ensure_config
+  label="${label//$'\t'/ }"
+  label="${label//$'\n'/ }"
+
+  tmp=$(mktemp)
+  awk -F '\t' -v OFS='\t' -v id="$id" -v label="$label" -v mode="$mode" '
+    BEGIN { found = 0 }
+    /^[[:space:]]*#/ { print; next }
+    NF < 1 || $1 == "" { print; next }
+    $1 == id { print id, label, mode; found = 1; next }
+    { print }
+    END { if (!found) print id, label, mode }
+  ' "$WORKSPACE_CONFIG" >"$tmp"
+  mv "$tmp" "$WORKSPACE_CONFIG"
+}
+
+workspace_ns() {
+  echo "omarchy-ws-$1"
+}
+
+workspace_host_if() {
+  echo "omw$1h"
+}
+
+workspace_ns_if() {
+  echo "omw$1n"
+}
+
+workspace_subnet() {
+  echo "$NET_PREFIX.$1.0/24"
+}
+
+workspace_supernet() {
+  echo "$NET_PREFIX.0.0/16"
+}
+
+workspace_host_ip() {
+  echo "$NET_PREFIX.$1.1"
+}
+
+workspace_ns_ip() {
+  echo "$NET_PREFIX.$1.2"
+}
+
+netns_exists() {
+  local ns="$1"
+
+  ip netns list 2>/dev/null | awk '{ print $1 }' | grep -Fx "$ns" >/dev/null
+}
+
+ensure_iptables_rule() {
+  local table="$1"
+  local chain="$2"
+  local position="$3"
+
+  shift 3
+
+  if sudo iptables -t "$table" -C "$chain" "$@" 2>/dev/null; then
+    return
+  fi
+
+  if [[ $position == "insert" ]]; then
+    sudo iptables -t "$table" -I "$chain" 1 "$@"
+  else
+    sudo iptables -t "$table" -A "$chain" "$@"
+  fi
+}
+
+ensure_netns() {
+  local id="$1"
+  local mode
+  local ns
+  local host_if
+  local ns_if
+  local host_ip
+  local ns_ip
+  local subnet
+  local supernet
+
+  mode=$(workspace_network "$id")
+  [[ $mode == "host" ]] && return
+
+  require_cmd ip
+  require_cmd sudo
+
+  ns=$(workspace_ns "$id")
+  host_if=$(workspace_host_if "$id")
+  ns_if=$(workspace_ns_if "$id")
+  host_ip=$(workspace_host_ip "$id")
+  ns_ip=$(workspace_ns_ip "$id")
+  subnet=$(workspace_subnet "$id")
+  supernet=$(workspace_supernet)
+
+  if ! netns_exists "$ns"; then
+    sudo ip netns add "$ns"
+    sudo ip netns exec "$ns" ip link set lo up
+  fi
+
+  if [[ $mode == "offline" ]]; then
+    return
+  fi
+
+  if ! ip link show "$host_if" >/dev/null 2>&1; then
+    sudo ip link add "$host_if" type veth peer name "$ns_if"
+    sudo ip link set "$ns_if" netns "$ns"
+  fi
+
+  sudo ip addr replace "$host_ip/24" dev "$host_if"
+  sudo ip link set "$host_if" up
+  sudo ip netns exec "$ns" ip addr replace "$ns_ip/24" dev "$ns_if"
+  sudo ip netns exec "$ns" ip link set "$ns_if" up
+  sudo ip netns exec "$ns" ip route replace default via "$host_ip"
+  sudo mkdir -p "/etc/netns/$ns"
+  printf 'nameserver %s\n' "$NET_DNS" | sudo tee "/etc/netns/$ns/resolv.conf" >/dev/null
+
+  require_cmd iptables
+  sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  ensure_iptables_rule filter FORWARD insert -s "$subnet" -d "$supernet" -j REJECT
+  ensure_iptables_rule filter FORWARD insert -d "$subnet" -s "$supernet" -j REJECT
+  ensure_iptables_rule filter FORWARD append -s "$subnet" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+  ensure_iptables_rule filter FORWARD append -d "$subnet" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ensure_iptables_rule nat POSTROUTING append -s "$subnet" ! -d "$supernet" -j MASQUERADE
+}
+
+env_args() {
+  local user
+
+  user=$(current_user)
+
+  printf 'HOME=%s\0' "$HOME"
+  printf 'USER=%s\0' "$user"
+  printf 'LOGNAME=%s\0' "$user"
+  printf 'PATH=%s\0' "$PATH"
+  printf 'SHELL=%s\0' "${SHELL:-/bin/bash}"
+  [[ -n ${LANG:-} ]] && printf 'LANG=%s\0' "$LANG"
+  [[ -n ${LC_ALL:-} ]] && printf 'LC_ALL=%s\0' "$LC_ALL"
+  [[ -n ${DISPLAY:-} ]] && printf 'DISPLAY=%s\0' "$DISPLAY"
+  [[ -n ${WAYLAND_DISPLAY:-} ]] && printf 'WAYLAND_DISPLAY=%s\0' "$WAYLAND_DISPLAY"
+  [[ -n ${XDG_RUNTIME_DIR:-} ]] && printf 'XDG_RUNTIME_DIR=%s\0' "$XDG_RUNTIME_DIR"
+  [[ -n ${XDG_CURRENT_DESKTOP:-} ]] && printf 'XDG_CURRENT_DESKTOP=%s\0' "$XDG_CURRENT_DESKTOP"
+  [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && printf 'HYPRLAND_INSTANCE_SIGNATURE=%s\0' "$HYPRLAND_INSTANCE_SIGNATURE"
+  [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] && printf 'DBUS_SESSION_BUS_ADDRESS=%s\0' "$DBUS_SESSION_BUS_ADDRESS"
+  [[ -n ${SSH_AUTH_SOCK:-} ]] && printf 'SSH_AUTH_SOCK=%s\0' "$SSH_AUTH_SOCK"
+}
+
+run_in_netns() {
+  local id="$1"
+  local mode
+  local ns
+  local env=()
+  local user
+
+  shift
+  (( $# > 0 )) || die "Missing command"
+
+  mode=$(workspace_network "$id")
+  if [[ $mode == "host" ]]; then
+    exec "$@"
+  fi
+
+  ensure_netns "$id"
+  ns=$(workspace_ns "$id")
+  user=$(current_user)
+  mapfile -d '' -t env < <(env_args)
+
+  exec sudo ip netns exec "$ns" sudo -u "$user" env "${env[@]}" "$@"
+}
+
+shell_join() {
+  local out=""
+  local quoted
+  local arg
+
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    out+="$quoted "
+  done
+
+  printf '%s' "${out% }"
+}
+
+cmd_list() {
+  local active
+  local id
+  local label
+  local mode
+  local ns
+  local state
+  local mark
+
+  active=$(active_workspace)
+  printf '%-2s %-5s %-20s %-9s %-8s\n' "" "ID" "LABEL" "NETWORK" "NS"
+  while IFS=$'\t' read -r id label mode; do
+    [[ -z $id ]] && continue
+    mark=" "
+    [[ $id == "$active" ]] && mark="*"
+    ns=$(workspace_ns "$id")
+    if [[ ${mode:-isolated} == "host" ]]; then
+      state="host"
+    elif netns_exists "$ns"; then
+      state="up"
+    else
+      state="down"
+    fi
+    printf '%-2s %-5s %-20s %-9s %-8s\n' "$mark" "$id" "${label:-$id}" "${mode:-isolated}" "$state"
+  done < <(workspace_rows)
+}
+
+cmd_apply() {
+  local id
+  local label
+  local mode
+  local has_hypr=0
+
+  if hypr_available; then
+    has_hypr=1
+  fi
+
+  while IFS=$'\t' read -r id label mode; do
+    [[ -z $id || -z ${label:-} ]] && continue
+    ensure_netns "$id"
+    if (( has_hypr )); then
+      hyprctl dispatch renameworkspace "$id" "$label" >/dev/null 2>&1 || true
+    fi
+  done < <(workspace_rows)
+}
+
+cmd_focus() {
+  local id
+
+  id=$(resolve_workspace "${1:-}")
+  hypr_available || die "Hyprland is not available"
+  hyprctl dispatch workspace "$id" >/dev/null
+}
+
+cmd_move() {
+  local id
+
+  id=$(resolve_workspace "${1:-}")
+  hypr_available || die "Hyprland is not available"
+  hyprctl dispatch movetoworkspace "$id" >/dev/null
+}
+
+cmd_rename() {
+  local id
+  local label
+  local mode
+
+  (( $# >= 2 )) || die "Usage: omarchy workspace rename <workspace> <label>"
+  id=$(resolve_workspace "$1")
+  shift
+  label="$*"
+  mode=$(workspace_network "$id")
+  set_workspace "$id" "$label" "$mode"
+
+  if hypr_available; then
+    hyprctl dispatch renameworkspace "$id" "$label" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_network() {
+  local id
+  local label
+  local mode
+
+  (( $# >= 1 )) || die "Usage: omarchy workspace network <workspace> [host|isolated|offline]"
+  id=$(resolve_workspace "$1")
+
+  if (( $# == 1 )); then
+    workspace_network "$id"
+    return
+  fi
+
+  mode="$2"
+  [[ $mode =~ ^(host|isolated|offline)$ ]] || die "Network mode must be host, isolated, or offline"
+  label=$(workspace_label "$id")
+  set_workspace "$id" "$label" "$mode"
+}
+
+cmd_launch() {
+  local id
+  local command_line
+
+  (( $# >= 2 )) || die "Usage: omarchy workspace launch <workspace> <command...>"
+  id=$(resolve_workspace "$1")
+  shift
+
+  if hypr_available; then
+    command_line=$(shell_join "$@")
+    hyprctl dispatch exec "[workspace $id silent] omarchy-workspace exec-in-namespace $id $command_line" >/dev/null
+  else
+    run_in_netns "$id" "$@"
+  fi
+}
+
+cmd_shell() {
+  local id
+
+  id=$(resolve_workspace "${1:-active}")
+  run_in_netns "$id" "${SHELL:-/bin/bash}"
+}
+
+cmd_tabbar() {
+  local position="${1:-}"
+  local side_width="${2:-72}"
+  local height
+  local width
+  local waybar_config="$CONFIG_HOME/waybar/config.jsonc"
+
+  [[ $position =~ ^(top|bottom|left|right)$ ]] || die "Usage: omarchy workspace tabbar <top|bottom|left|right> [side-width]"
+  [[ -f $waybar_config ]] || die "Missing Waybar config: $waybar_config"
+
+  if [[ $position == "left" || $position == "right" ]]; then
+    height=0
+    width="$side_width"
+  else
+    height=26
+    width=0
+  fi
+
+  sed -i -E "s/(\"position\"[[:space:]]*:[[:space:]]*\")[a-z]+(\")/\\1${position}\\2/" "$waybar_config"
+  sed -i -E "s/(\"height\"[[:space:]]*:[[:space:]]*)[0-9]+/\\1${height}/; s/(\"width\"[[:space:]]*:[[:space:]]*)[0-9]+/\\1${width}/" "$waybar_config"
+  sed -i -E '0,/"format"[[:space:]]*:[[:space:]]*"[^"]*"/s//"format": "{name}"/' "$waybar_config"
+  omarchy-restart-waybar
+}
+
+cmd_netns() {
+  local action="${1:-}"
+  local id
+  local ns
+  local host_if
+  local env=()
+  local user
+
+  [[ $action =~ ^(up|down|enter)$ ]] || die "Usage: omarchy workspace netns <up|down|enter> <workspace>"
+  id=$(resolve_workspace "${2:-}")
+  ns=$(workspace_ns "$id")
+  host_if=$(workspace_host_if "$id")
+
+  case "$action" in
+  up)
+    ensure_netns "$id"
+    ;;
+  down)
+    require_cmd ip
+    require_cmd sudo
+    if netns_exists "$ns"; then
+      sudo ip netns delete "$ns"
+    fi
+    if ip link show "$host_if" >/dev/null 2>&1; then
+      sudo ip link delete "$host_if"
+    fi
+    ;;
+  enter)
+    ensure_netns "$id"
+    user=$(current_user)
+    mapfile -d '' -t env < <(env_args)
+    exec sudo ip netns exec "$ns" sudo -u "$user" env "${env[@]}" "${SHELL:-/bin/bash}"
+    ;;
+  esac
+}
+
+cmd_audit() {
+  local pid
+  local id
+  local title
+  local mode
+  local ns
+  local expected
+  local actual
+  local leaked=0
+
+  hypr_available || die "Hyprland is not available"
+  require_cmd ip
+  require_cmd jq
+  require_cmd sudo
+
+  while IFS=$'\t' read -r pid id title; do
+    [[ -z $pid || -z $id ]] && continue
+    mode=$(workspace_network "$id")
+    [[ $mode == "host" ]] && continue
+    ns=$(workspace_ns "$id")
+    if ! netns_exists "$ns"; then
+      printf 'workspace %s namespace is down: %s\n' "$id" "$title"
+      leaked=1
+      continue
+    fi
+    expected=$(sudo ip netns exec "$ns" readlink /proc/self/ns/net 2>/dev/null || true)
+    actual=$(readlink "/proc/$pid/ns/net" 2>/dev/null || true)
+    if [[ -n $expected && -n $actual && $expected != "$actual" ]]; then
+      printf 'workspace %s process outside namespace: pid=%s title=%s\n' "$id" "$pid" "$title"
+      leaked=1
+    fi
+  done < <(hyprctl clients -j | jq -r '.[] | [.pid, .workspace.id, .title] | @tsv')
+
+  (( leaked == 0 )) || exit 1
+}
+
+main() {
+  local command="${1:-}"
+
+  case "$command" in
+  "" | "-h" | "--help" | "help")
+    usage
+    ;;
+  list)
+    shift
+    cmd_list "$@"
+    ;;
+  apply)
+    shift
+    cmd_apply "$@"
+    ;;
+  focus | switch)
+    shift
+    cmd_focus "$@"
+    ;;
+  move)
+    shift
+    cmd_move "$@"
+    ;;
+  rename)
+    shift
+    cmd_rename "$@"
+    ;;
+  network)
+    shift
+    cmd_network "$@"
+    ;;
+  launch)
+    shift
+    cmd_launch "$@"
+    ;;
+  shell)
+    shift
+    cmd_shell "$@"
+    ;;
+  tabbar | tabs)
+    shift
+    cmd_tabbar "$@"
+    ;;
+  netns)
+    shift
+    cmd_netns "$@"
+    ;;
+  audit)
+    shift
+    cmd_audit "$@"
+    ;;
+  exec-in-namespace)
+    shift
+    id=$(resolve_workspace "${1:-}")
+    shift
+    run_in_netns "$id" "$@"
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+  esac
+}
+
+main "$@"

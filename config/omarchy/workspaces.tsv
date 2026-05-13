@@ -1,0 +1,6 @@
+# id	label	network
+1	home	isolated
+2	code	isolated
+3	web	isolated
+4	chat	isolated
+5	ops	isolated
