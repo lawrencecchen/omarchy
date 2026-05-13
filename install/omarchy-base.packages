@@ -62,6 +62,8 @@ impala
 imv
 inetutils
 inxi
+iproute2
+iptables-nft
 iwd
 jq
 kdenlive
